@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Network Device Map</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f0f0f0;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            padding: 1rem;
+            background: #333;
+            color: white;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #888;
+        }
+
+        .status-indicator.scanning {
+            background: #ffd700;
+            animation: pulse 1s infinite;
+        }
+
+        .status-indicator.complete {
+            background: #4caf50;
+        }
+
+        .status-indicator.error {
+            background: #ff4444;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+
+        .main-container {
+            display: flex;
+            height: calc(100vh - 60px);
+        }
+
+        #graph {
+            flex: 1;
+            background: white;
+        }
+
+        .console-container {
+            width: 300px;
+            background: #1e1e1e;
+            color: #fff;
+            font-family: monospace;
+            display: flex;
+            flex-direction: column;
+            border-left: 1px solid #333;
+        }
+
+        .console-header {
+            padding: 0.5rem;
+            background: #333;
+            border-bottom: 1px solid #444;
+        }
+
+        .console-output {
+            flex: 1;
+            padding: 0.5rem;
+            overflow-y: auto;
+            font-size: 12px;
+        }
+
+        .console-entry {
+            margin: 2px 0;
+            padding: 2px 0;
+            border-bottom: 1px solid #333;
+        }
+
+        .console-time {
+            color: #888;
+        }
+
+        .console-message {
+            margin-left: 8px;
+        }
+
+        .console-message.success {
+            color: #4caf50;
+        }
+
+        .console-message.error {
+            color: #ff4444;
+        }
+
+        .console-message.info {
+            color: #2196f3;
+        }
+
+        .node {
+            stroke: #fff;
+            stroke-width: 0.2px;  /* Reduced from 0.3px */
+        }
+
+        .link {
+            stroke: #666;
+            stroke-opacity: 0.8;
+            stroke-width: 1.5px;
+            transition: stroke-width 0.3s;
+            marker-end: url(#end);  /* Add default marker */
+        }
+    
+        .link.active {
+            stroke: #ff7f0e;
+            stroke-width: 2px;
+        }
+    
+        .traffic-label {
+            font-size: 10px;
+            fill: #666;
+        }
+
+        .tooltip {
+            position: absolute;
+            padding: 15px;
+            background: rgba(33, 33, 33, 0.95);
+            color: white;
+            border-radius: 6px;
+            font-size: 12px;
+            pointer-events: none;
+            max-width: 350px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .tooltip-section {
+            margin: 8px 0;
+            padding-top: 8px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .tooltip-section:first-child {
+            margin-top: 0;
+            padding-top: 0;
+            border-top: none;
+        }
+
+        .tooltip-title {
+            color: #2196f3;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .tooltip-grid {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 4px 12px;
+        }
+
+        .tooltip-label {
+            color: #888;
+            white-space: nowrap;
+        }
+
+        .tooltip-value {
+            color: #fff;
+        }
+
+        .tooltip-status {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+
+        .status-active { background: #4caf50; }
+        .status-inactive { background: #ff4444; }
+        .status-unknown { background: #ffd700; }
+
+        .controls {
+            display: flex;
+            gap: 1rem;
+        }
+
+        button {
+            padding: 0.5rem 1rem;
+            border: none;
+            border-radius: 4px;
+            background: #4caf50;
+            color: white;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+
+        button:hover {
+            background: #45a049;
+        }
+
+        button:disabled {
+            background: #888;
+            cursor: not-allowed;
+        }
+
+        .controls input {
+            padding: 0.5rem;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            width: 150px;
+        }
+
+        .node-label {
+            font-size: 10px;
+            fill: #333;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        .node-group:hover .node {
+            stroke: #000;
+            stroke-width: 1.5px;
+        }
+
+        .manufacturer-info {
+            margin-top: 5px;
+            padding-top: 5px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .manufacturer-title {
+            color: #2196f3;
+            font-weight: bold;
+            margin-bottom: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="status">
+            <div class="status-indicator" id="statusIndicator"></div>
+            <span id="statusText">Ready</span>
+        </div>
+        <div class="controls">
+            <input type="text" id="ipRange" placeholder="192.168.1.0/24" value="">
+            <button id="scanButton" onclick="startScan()">Start Scan</button>
+            <button id="clearButton" onclick="clearConsole()">Clear Console</button>
+        </div>
+    </div>
+    <div class="main-container">
+        <div id="graph"></div>
+        <div class="console-container">
+            <div class="console-header">Console Output</div>
+            <div class="console-output" id="consoleOutput"></div>
+        </div>
+    </div>
+
+    <script>
+        // Add platform detection at the top
+        const platform = navigator.platform.toLowerCase();
+        const isWindows = platform.includes('win');
+        const isLinux = platform.includes('linux');
+
+        // Console management
+        function logToConsole(message, type = 'info') {
+            const consoleOutput = document.getElementById('consoleOutput');
+            const entry = document.createElement('div');
+            entry.className = 'console-entry';
+            
+            const time = new Date().toLocaleTimeString();
+            entry.innerHTML = `
+                <span class="console-time">[${time}]</span>
+                <span class="console-message ${type}">${message}</span>
+            `;
+            
+            consoleOutput.appendChild(entry);
+            consoleOutput.scrollTop = consoleOutput.scrollHeight;
+        }
+
+        function clearConsole() {
+            document.getElementById('consoleOutput').innerHTML = '';
+            logToConsole('Console cleared', 'info');
+        }
+
+        // Status management
+        function updateStatus(status, text) {
+            const indicator = document.getElementById('statusIndicator');
+            const statusText = document.getElementById('statusText');
+            
+            indicator.className = 'status-indicator ' + status;
+            statusText.textContent = text;
+        }
+
+        // Initialize the visualization
+        const width = document.getElementById('graph').clientWidth;
+        const height = document.getElementById('graph').clientHeight;
+
+        const svg = d3.select("#graph")
+            .append("svg")
+            .attr("width", "100%")
+            .attr("height", "100%")
+            .attr("viewBox", `0 0 ${width} ${height}`);
+
+        const tooltip = d3.select("body")
+            .append("div")
+            .attr("class", "tooltip")
+            .style("opacity", 0);
+
+        // Create force simulation
+        const simulation = d3.forceSimulation()
+            .force("link", d3.forceLink().id(d => d.id)
+                .distance(100)    // Reduced distance
+                .strength(0.5)    // Reduced strength for more stability
+            )
+            .force("charge", d3.forceManyBody()
+                .strength(-300)   // Reduced repulsion
+                .distanceMax(250) // Limit force application range
+            )
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .force("collision", d3.forceCollide().radius(20));
+
+        // Modify startScan function
+        async function startScan() {
+            try {
+                // Update UI state
+                document.getElementById('scanButton').disabled = true;
+                updateStatus('scanning', 'Scanning network...');
+                logToConsole('Starting network scan...', 'info');
+
+                // Clear previous visualization
+                svg.selectAll("*").remove();
+
+                const ipRange = document.getElementById('ipRange').value;
+                const url = ipRange ? `/api/scan?range=${encodeURIComponent(ipRange)}` : '/api/scan';
+                
+                const response = await fetch(url);
+                const data = await response.json();
+
+                // Store data globally for use in updateConnections
+                window.networkData = data;
+
+                // Create the graph group
+                const graphGroup = svg.append("g").attr("class", "graph-group");
+
+                // Create links with updated styling
+                const link = graphGroup.append("g")
+                    .selectAll("line")
+                    .data(data.links)
+                    .enter().append("line")
+                    .attr("class", "link")
+                    .attr("stroke-width", d => d.value || 1.5);
+
+                // Create marker definitions for arrows with adjusted size
+                graphGroup.append("defs").selectAll("marker")
+                    .data(["end"])
+                    .enter().append("marker")
+                    .attr("id", String)
+                    .attr("viewBox", "0 -5 10 10")
+                    .attr("refX", 25)        // Increased to move arrow away from node
+                    .attr("refY", 0)         // Centered on the line
+                    .attr("markerWidth", 4)  // Reduced size
+                    .attr("markerHeight", 4) // Reduced size
+                    .attr("orient", "auto")
+                    .append("path")
+                    .attr("fill", "#666")
+                    .attr("d", "M0,-5L10,0L0,5");
+
+                // Create nodes with labels
+                const nodeGroup = graphGroup.append("g")
+                    .selectAll("g")
+                    .data(data.nodes)
+                    .enter()
+                    .append("g")
+                    .attr("class", "node-group");
+
+                // Add circles for nodes
+                nodeGroup.append("circle")
+                    .attr("class", "node")
+                    .attr("r", d => d.isGateway ? 8 : 5)
+                    .attr("fill", d => d.isGateway ? "#ff4444" : d.isLocal ? "#4CAF50" : "#1f77b4");
+
+                // Add labels
+                nodeGroup.append("text")
+                    .attr("class", "node-label")
+                    .attr("dx", 12)
+                    .attr("dy", 4)
+                    .text(d => `${d.name || d.id}`);
+
+                // Add interactions
+                nodeGroup
+                    .call(d3.drag()
+                        .on("start", dragstarted)
+                        .on("drag", dragged)
+                        .on("end", dragended))
+                    .on("mouseover", (event, d) => showTooltip(event, d))
+                    .on("mouseout", hideTooltip);
+
+                // Adjust force simulation
+                simulation
+                    .nodes(data.nodes)
+                    .force("link").links(data.links);
+
+                // Run simulation multiple times to achieve better initial layout
+                simulation.alpha(1).restart();
+                for (let i = 0; i < 100; ++i) simulation.tick();
+                simulation.alpha(0.3).restart();
+
+                simulation.on("tick", () => {
+                    link
+                        .attr("x1", d => d.source.x)
+                        .attr("y1", d => d.source.y)
+                        .attr("x2", d => d.target.x)
+                        .attr("y2", d => d.target.y);
+
+                    nodeGroup
+                        .attr("transform", d => `translate(${d.x},${d.y})`);
+                });
+
+                // Add zoom behavior with initial transform
+                const zoom = d3.zoom()
+                    .scaleExtent([0.1, 4])
+                    .on("zoom", (event) => {
+                        graphGroup.attr("transform", event.transform);
+                    });
+
+                svg.call(zoom);
+
+                // Calculate initial zoom transform
+                const bounds = graphGroup.node().getBBox();
+                const fullWidth = Math.max(bounds.width, 100);
+                const fullHeight = Math.max(bounds.height, 100);
+                const scale = 0.8 / Math.max(
+                    fullWidth / width,
+                    fullHeight / height
+                );
+                const tx = width/2 - (bounds.x + bounds.width/2) * scale;
+                const ty = height/2 - (bounds.y + bounds.height/2) * scale;
+
+                // Apply initial transform with transition
+                svg.transition()
+                    .duration(750)
+                    .call(zoom.transform, 
+                        d3.zoomIdentity
+                            .translate(tx, ty)
+                            .scale(scale)
+                    );
+
+                // Update UI state
+                updateStatus('complete', 'Scan complete');
+                logToConsole('Network scan completed successfully', 'success');
+            } catch (error) {
+                console.error("Error during scan:", error);
+                updateStatus('error', 'Scan failed');
+                logToConsole(`Error during scan: ${error.message}`, 'error');
+                svg.selectAll("*").remove();
+            } finally {
+                document.getElementById('scanButton').disabled = false;
+            }
+        }
+
+        // Add tooltip functions before updateVisualization
+        function showTooltip(event, d) {
+            const portsInfo = d.ports?.length > 0 
+                ? `<div class="tooltip-section">
+                    <div class="tooltip-title">Open Ports</div>
+                    <div class="tooltip-grid">
+                        <div class="tooltip-label">Ports:</div>
+                        <div class="tooltip-value">${d.ports.join(', ')}</div>
+                        ${d.services ? `
+                        <div class="tooltip-label">Services:</div>
+                        <div class="tooltip-value">${d.services.join(', ')}</div>
+                        ` : ''}
+                    </div>
+                   </div>` 
+                : '';
+
+            const trafficInfo = d.traffic 
+                ? `<div class="tooltip-section">
+                    <div class="tooltip-title">Network Traffic</div>
+                    <div class="tooltip-grid">
+                        <div class="tooltip-label">Tx:</div>
+                        <div class="tooltip-value">${formatBytes(d.traffic.tx)}/s</div>
+                        <div class="tooltip-label">Rx:</div>
+                        <div class="tooltip-value">${formatBytes(d.traffic.rx)}/s</div>
+                    </div>
+                   </div>`
+                : '';
+
+            const statusClass = d.status === 'up' ? 'status-active' 
+                            : d.status === 'down' ? 'status-inactive' 
+                            : 'status-unknown';
+                
+            tooltip.transition()
+                .duration(200)
+                .style("opacity", .95);
+                
+            tooltip.html(`
+                <div class="tooltip-section">
+                    <div class="tooltip-grid">
+                        <div class="tooltip-label">Name:</div>
+                        <div class="tooltip-value">${d.name || 'Unknown'}</div>
+                        <div class="tooltip-label">Status:</div>
+                        <div class="tooltip-value">
+                            <span class="tooltip-status ${statusClass}"></span>
+                            ${d.status || 'Unknown'}
+                        </div>
+                        <div class="tooltip-label">IP:</div>
+                        <div class="tooltip-value">${d.id}</div>
+                        <div class="tooltip-label">MAC:</div>
+                        <div class="tooltip-value">${d.mac || 'Unknown'}</div>
+                        <div class="tooltip-label">Type:</div>
+                        <div class="tooltip-value">${d.isGateway ? 'Gateway' : 'Device'}</div>
+                    </div>
+                </div>
+                ${portsInfo}
+                ${trafficInfo}
+                <div class="tooltip-section">
+                    <div class="tooltip-title">Manufacturer Info</div>
+                    <div class="tooltip-grid">
+                        <div class="tooltip-label">Name:</div>
+                        <div class="tooltip-value">${d.manufacturer?.companyName || 'Unknown'}</div>
+                        <div class="tooltip-label">Country:</div>
+                        <div class="tooltip-value">${d.manufacturer?.countryCode || 'N/A'}</div>
+                    </div>
+                </div>
+            `)
+            .style("left", (event.pageX + 15) + "px")
+            .style("top", (event.pageY - 28) + "px");
+        }
+
+        function hideTooltip() {
+            tooltip.transition()
+                .duration(500)
+                .style("opacity", 0);
+        }
+
+        // Add helper function for formatting bytes
+        function formatBytes(bytes, decimals = 2) {
+            if (!bytes) return '0 B';
+            const k = 1024;
+            const dm = decimals < 0 ? 0 : decimals;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+        }
+
+        // Drag functions
+        function dragstarted(event) {
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            event.subject.fx = event.subject.x;
+            event.subject.fy = event.subject.y;
+            logToConsole(`Started dragging node: ${event.subject.id}`, 'info');
+        }
+
+        function dragged(event) {
+            event.subject.fx = event.x;
+            event.subject.fy = event.y;
+        }
+
+        function dragended(event) {
+            if (!event.active) simulation.alphaTarget(0);
+            event.subject.fx = null;
+            event.subject.fy = null;
+            logToConsole(`Finished dragging node: ${event.subject.id}`, 'info');
+        }
+
+        // Initial setup
+        logToConsole('Application initialized', 'info');
+        logToConsole(`Platform detected: ${navigator.platform}`, 'info');
+        logToConsole(`Features: ${isLinux ? 'Full' : 'Basic'} functionality available`, 'info');
+        updateStatus('', 'Ready');
+    </script>
+</body>
+</html>
