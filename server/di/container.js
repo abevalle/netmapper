@@ -1,8 +1,8 @@
-
 class Container {
     constructor(config) {
         this.config = config;
         this.services = new Map();
+        this.services.set('networkScanner', new NetworkScanner(this.config));
     }
 
     async initialize() {

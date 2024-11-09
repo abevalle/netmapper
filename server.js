@@ -12,6 +12,10 @@ const NetworkDiscovery = require('./server/services/networkDiscovery');
 const config = require('./server/config/config');
 const MACResolver = require('./server/services/macResolver');
 const macResolver = new MACResolver(config);
+const os = require('os');  // Add this import
+const powerShell = require('node-powershell'); // Add this for better PowerShell support
+const { Client: SSDPClient } = require('node-ssdp');  // Replace upnp dependency
+const wmi = require('node-wmi');  // Update wmi import
 
 // Add platform detection
 const isWindows = process.platform === 'win32';
@@ -88,47 +92,34 @@ function executeCommand(command, args = []) {
     });
 }
 
+// Add new network utilities
+const snmp = require('net-snmp');  // Add this dependency
+
 // Update Windows MAC resolution function
 async function getWindowsMAC(ip) {
     try {
-        // Try PowerShell first for more reliable results
-        try {
-            const cmd = `powershell -Command "Get-NetNeighbor -IPAddress ${ip} | Select-Object -ExpandProperty LinkLayerAddress"`;
-            const mac = execSync(cmd, { encoding: 'utf8' }).trim();
-            if (mac && mac.length > 0) {
-                console.debug(`Found MAC for ${ip} using PowerShell: ${mac}`);
-                return mac;
-            }
-        } catch (e) {
-            console.debug(`PowerShell MAC resolution failed for ${ip}`);
+        // First attempt: Direct ARP after ping
+        const macFromArp = await tryArpResolution(ip);
+        if (macFromArp && macFromArp !== 'Unknown') {
+            return macFromArp;
         }
 
-        // Try ARP as fallback
-        const arpOutput = await executeCommand('arp -a ' + ip);
-        if (arpOutput) {
-            const lines = arpOutput.split('\n');
-            for (const line of lines) {
-                if (line.includes(ip)) {
-                    const match = line.match(/([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})/);
-                    if (match) {
-                        console.debug(`Found MAC for ${ip} using ARP: ${match[0]}`);
-                        return match[0];
-                    }
-                }
-            }
+        // Second attempt: SNMP query if device supports it
+        const macFromSnmp = await trySnmpResolution(ip);
+        if (macFromSnmp) {
+            return macFromSnmp;
         }
 
-        // Try netsh as last resort
-        try {
-            const cmd = `netsh interface ip show neighbors "${ip}"`;
-            const output = execSync(cmd, { encoding: 'utf8' });
-            const match = output.match(/([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})/);
-            if (match) {
-                console.debug(`Found MAC for ${ip} using netsh: ${match[0]}`);
-                return match[0];
-            }
-        } catch (e) {
-            console.debug(`netsh MAC resolution failed for ${ip}`);
+        // Third attempt: WMI query for Windows devices
+        const macFromWmi = await tryWmiResolution(ip);
+        if (macFromWmi) {
+            return macFromWmi;
+        }
+
+        // Fourth attempt: UPnP discovery
+        const macFromUpnp = await tryUpnpResolution(ip);
+        if (macFromUpnp) {
+            return macFromUpnp;
         }
 
         return 'Unknown';
@@ -136,6 +127,247 @@ async function getWindowsMAC(ip) {
         console.error(`Failed to get MAC for ${ip}:`, error.message);
         return 'Unknown';
     }
+}
+
+// Update tryArpResolution function to handle Windows differently
+async function tryArpResolution(ip) {
+    try {
+        // Get all network interfaces
+        const interfaces = os.networkInterfaces();
+        
+        // Try ping through each interface
+        for (const [name, addrs] of Object.entries(interfaces)) {
+            const ipv4 = addrs.find(addr => addr.family === 'IPv4' && !addr.internal);
+            if (ipv4) {
+                try {
+                    // Windows doesn't support -S flag, use different format
+                    const pingCmd = isWindows 
+                        ? `ping -n 1 -w 500 ${ip}`
+                        : `ping -c 1 -W 500 -I ${ipv4.address} ${ip}`;
+                    
+                    await executeCommand(pingCmd);
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                } catch (e) {
+                    console.debug(`Ping failed through interface ${name}`);
+                }
+            }
+        }
+
+        // Check ARP table after all pings
+        const output = await executeCommand('arp -a');
+        const lines = output.split('\n');
+        for (const line of lines) {
+            // Adjust regex for Windows ARP output format
+            const matches = line.match(new RegExp(`${ip}\\s+([0-9a-fA-F-]{17})`));
+            if (matches && matches[1]) {
+                const mac = matches[1].replace(/-/g, ':');
+                console.debug(`Found MAC for ${ip} using ARP: ${mac}`);
+                return mac;
+            }
+        }
+    } catch (e) {
+        console.debug(`ARP resolution failed for ${ip}: ${e.message}`);
+    }
+    return null;
+}
+
+async function trySnmpResolution(ip) {
+    return new Promise((resolve) => {
+        let isResolved = false;
+        let session = null;
+        
+        try {
+            session = snmp.createSession(ip, 'public', {
+                timeout: 1000,
+                retries: 0,
+                transport: 'udp4'
+            });
+            
+            const oid = '1.3.6.1.2.1.2.2.1.6.2'; // MAC address OID
+
+            session.get([oid], (error, varbinds) => {
+                if (isResolved) return;
+                isResolved = true;
+                
+                try {
+                    if (session) {
+                        session.close();
+                        session = null;
+                    }
+                } catch (closeError) {
+                    console.debug(`SNMP session close error for ${ip}: ${closeError.message}`);
+                }
+                
+                if (error) {
+                    console.debug(`SNMP failed for ${ip}: ${error.message}`);
+                    resolve(null);
+                } else {
+                    try {
+                        const mac = varbinds[0]?.value?.toString('hex')
+                            .match(/.{1,2}/g)?.join(':');
+                        if (mac) {
+                            console.debug(`Found MAC for ${ip} using SNMP: ${mac}`);
+                            resolve(mac);
+                        } else {
+                            resolve(null);
+                        }
+                    } catch (parseError) {
+                        console.debug(`SNMP parse error for ${ip}: ${parseError.message}`);
+                        resolve(null);
+                    }
+                }
+            });
+
+            // Set timeout
+            setTimeout(() => {
+                if (!isResolved) {
+                    isResolved = true;
+                    try {
+                        if (session) {
+                            session.close();
+                            session = null;
+                        }
+                    } catch (closeError) {
+                        console.debug(`SNMP timeout session close error for ${ip}: ${closeError.message}`);
+                    }
+                    resolve(null);
+                }
+            }, 1000);
+
+            // Handle session errors
+            session.on('error', (err) => {
+                if (!isResolved) {
+                    isResolved = true;
+                    console.debug(`SNMP session error for ${ip}: ${err.message}`);
+                    try {
+                        if (session) {
+                            session.close();
+                            session = null;
+                        }
+                    } catch (closeError) {
+                        console.debug(`SNMP error handler close error for ${ip}: ${closeError.message}`);
+                    }
+                    resolve(null);
+                }
+            });
+
+        } catch (initError) {
+            console.debug(`SNMP initialization error for ${ip}: ${initError.message}`);
+            if (session) {
+                try {
+                    session.close();
+                } catch (closeError) {
+                    console.debug(`SNMP init error close error for ${ip}: ${closeError.message}`);
+                }
+            }
+            resolve(null);
+        }
+    });
+}
+
+// Replace WMI with direct PowerShell commands
+async function tryWmiResolution(ip) {
+    if (!isWindows) return null;
+
+    return new Promise((resolve) => {
+        try {
+            // Create a valid WQL query for network adapters
+            const wqlQuery = {
+                class: 'Win32_NetworkAdapterConfiguration',
+                properties: ['MacAddress', 'IPAddress'],
+                namespace: 'root\\CIMV2',
+                // Using a proper WQL WHERE clause
+                where: `IPEnabled = true AND IPAddress IS NOT NULL`
+            };
+
+            wmi.Query(wqlQuery, (err, results) => {
+                if (err) {
+                    console.debug(`WMI query failed for ${ip}: ${err.message}`);
+                    resolve(null);
+                    return;
+                }
+
+                // Look through results for matching IP
+                for (const adapter of results || []) {
+                    if (adapter.IPAddress && Array.isArray(adapter.IPAddress)) {
+                        // IPAddress is an array in WMI
+                        if (adapter.IPAddress.includes(ip) && adapter.MacAddress) {
+                            const mac = adapter.MacAddress.toUpperCase();
+                            console.debug(`Found MAC for ${ip} using WMI: ${mac}`);
+                            resolve(mac);
+                            return;
+                        }
+                    }
+                }
+
+                console.debug(`No matching WMI results for ${ip}`);
+                resolve(null);
+            });
+        } catch (error) {
+            console.debug(`WMI initialization failed for ${ip}: ${error.message}`);
+            resolve(null);
+        }
+    });
+}
+
+// Update tryUpnpResolution function with node-ssdp
+async function tryUpnpResolution(ip) {
+    return new Promise((resolve) => {
+        const client = new SSDPClient({
+            explicitSocketBind: true,  // Help with multiple NICs
+            reuseAddr: true
+        });
+        let found = false;
+
+        client.on('response', (headers, statusCode, rinfo) => {
+            if (rinfo.address === ip) {
+                // Try to extract MAC from device info
+                const location = headers.LOCATION;
+                const usn = headers.USN;
+                
+                // Try to find MAC in USN or device description
+                const macMatch = usn && usn.match(/uuid:[^:]*?([a-fA-F0-9]{12})|MAC=([a-fA-F0-9]{12})/i);
+                if (macMatch) {
+                    const mac = (macMatch[1] || macMatch[2])
+                        .match(/.{2}/g)
+                        .join(':')
+                        .toLowerCase();
+                    console.debug(`Found MAC for ${ip} using SSDP USN: ${mac}`);
+                    found = true;
+                    client.stop();
+                    resolve(mac);
+                }
+            }
+        });
+
+        // Search for all SSDP devices
+        client.search('ssdp:all');
+
+        // Set timeout and cleanup
+        setTimeout(() => {
+            if (!found) {
+                try {
+                    client.stop();
+                } catch (e) {
+                    console.debug(`SSDP client stop error: ${e.message}`);
+                }
+                resolve(null);
+            }
+        }, 5000);  // Give more time for SSDP responses
+
+        // Handle errors
+        client.on('error', (err) => {
+            console.debug(`SSDP error for ${ip}: ${err.message}`);
+            if (!found) {
+                try {
+                    client.stop();
+                } catch (e) {
+                    console.debug(`SSDP client stop error: ${e.message}`);
+                }
+                resolve(null);
+            }
+        });
+    });
 }
 
 // Add command availability check
@@ -425,7 +657,7 @@ async function scanChunk(ipList, options = {}) {
                             companyName: macInfo.vendor || 'Unknown',
                             countryCode: macInfo.countryCode || 'N/A'
                         },
-                        name: hostname || `Device ${networkDevices.length + 1}`,
+                        name: hostname || ip,  // Use IP instead of "Device N"
                         hostname,
                         ports: openPorts,
                         isAlive: true
@@ -667,7 +899,7 @@ app.get('/api/scan', async (req, res) => {
                                     companyName: macInfo.vendor || 'Unknown',
                                     countryCode: macInfo.countryCode || 'N/A'
                                 },
-                                name: hostname || `Device ${networkDevices.length + 1}`,
+                                name: hostname || ip,  // Use IP instead of "Device N"
                                 hostname,
                                 ports: openPorts,
                                 isAlive: true
@@ -802,3 +1034,37 @@ function isInSubnet(ip, cidr) {
         .map(octet => Number(octet).toString(2).padStart(8, '0'))
         .join('');
         return ipBinary.substring(0, mask) === networkBinary.substring(0, mask);}
+
+// Add new helper function for better PowerShell execution
+async function executePowerShell(command) {
+    const { PowerShell } = require('node-powershell');
+    
+    let ps = null;
+    try {
+        ps = new PowerShell();  // Initialize without options first
+        
+        // Configure PowerShell instance
+        await ps.configuration({
+            executionPolicy: 'Bypass',
+            noProfile: true,
+            inputEncoding: 'utf8',
+            outputEncoding: 'utf8'
+        });
+
+        // Add and execute command
+        await ps.addCommand(command);
+        const result = await ps.invoke();
+        return result;
+    } catch (error) {
+        console.debug(`PowerShell execution failed: ${error.message}`);
+        return null;
+    } finally {
+        if (ps) {
+            try {
+                await ps.dispose();
+            } catch (e) {
+                console.debug(`PowerShell dispose error: ${e.message}`);
+            }
+        }
+    }
+}

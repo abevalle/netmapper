@@ -584,7 +584,7 @@
                     .attr("class", d => `node-label ${d.isGateway ? 'gateway' : ''}`)
                     .attr("dx", d => d.isGateway ? 15 : 12)
                     .attr("dy", 4)
-                    .text(d => `${d.name || d.id}`);
+                    .text(d => d.hostname || d.ip);
 
                 // Add interactions
                 nodeGroup
@@ -701,7 +701,7 @@
                 <div class="tooltip-section">
                     <div class="tooltip-grid">
                         <div class="tooltip-label">Name:</div>
-                        <div class="tooltip-value">${d.name || 'Unknown'}</div>
+                        <div class="tooltip-value">${d.hostname || d.ip}</div>
                         <div class="tooltip-label">Status:</div>
                         <div class="tooltip-value">
                             <span class="tooltip-status ${statusClass}"></span>
@@ -810,7 +810,7 @@
                 item.className = 'node-list-item';
                 item.innerHTML = `
                     <div class="node-indicator ${node.isGateway ? 'gateway' : ''}"></div>
-                    <div>${node.name || node.id}</div>
+                    <div>${node.hostname || node.ip}</div>
                 `;
                 
                 item.addEventListener('click', () => selectNode(node));

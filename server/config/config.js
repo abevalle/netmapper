@@ -23,6 +23,18 @@ module.exports = {
         enabled: true,
         scanInterval: 300000, // 5 minutes
         includeRoutes: true,
-        maxSegments: 50
+        maxSegments: 50,
+        mdns: {
+            enabled: true,
+            timeout: 5000,  // 5 seconds timeout for mDNS discovery
+            services: [
+                '_http._tcp.local',
+                '_https._tcp.local',
+                '_workstation._tcp.local',
+                '_printer._tcp.local',
+                '_ipp._tcp.local',
+                '_smb._tcp.local'
+            ]
+        }
     }
 };

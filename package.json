@@ -12,8 +12,13 @@
   "description": "",
   "dependencies": {
     "express": "^4.21.1",
+    "multicast-dns": "^7.2.5",
+    "net-snmp": "^3.15.1",
     "network": "^0.7.0",
     "node-arp": "^1.0.6",
+    "node-powershell": "^5.0.1",
+    "node-ssdp": "^4.0.1",
+    "node-wmi": "^0.0.5",
     "ping": "^0.4.4"
   }
 }
