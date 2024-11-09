@@ -8,6 +8,10 @@ const dns = require('dns').promises;
 const net = require('net');
 const fs = require('fs').promises;
 const path = require('path');
+const NetworkDiscovery = require('./server/services/networkDiscovery');
+const config = require('./server/config/config');
+const MACResolver = require('./server/services/macResolver');
+const macResolver = new MACResolver(config);
 
 // Add platform detection
 const isWindows = process.platform === 'win32';
@@ -87,38 +91,49 @@ function executeCommand(command, args = []) {
 // Update Windows MAC resolution function
 async function getWindowsMAC(ip) {
     try {
-        // Try using ARP first
-        const arpOutput = executeCommand('arp -a ' + ip);
+        // Try PowerShell first for more reliable results
+        try {
+            const cmd = `powershell -Command "Get-NetNeighbor -IPAddress ${ip} | Select-Object -ExpandProperty LinkLayerAddress"`;
+            const mac = execSync(cmd, { encoding: 'utf8' }).trim();
+            if (mac && mac.length > 0) {
+                console.debug(`Found MAC for ${ip} using PowerShell: ${mac}`);
+                return mac;
+            }
+        } catch (e) {
+            console.debug(`PowerShell MAC resolution failed for ${ip}`);
+        }
+
+        // Try ARP as fallback
+        const arpOutput = await executeCommand('arp -a ' + ip);
         if (arpOutput) {
             const lines = arpOutput.split('\n');
             for (const line of lines) {
                 if (line.includes(ip)) {
                     const match = line.match(/([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})/);
-                    if (match) return match[0];
-                }
-            }
-        }
-
-        // Try using ipconfig as fallback
-        const ipconfigOutput = executeCommand('ipconfig /all');
-        if (ipconfigOutput) {
-            const lines = ipconfigOutput.split('\n');
-            for (let i = 0; i < lines.length; i++) {
-                if (lines[i].includes(ip)) {
-                    // Look for Physical Address in nearby lines
-                    for (let j = i - 5; j < i + 5; j++) {
-                        if (lines[j] && lines[j].includes('Physical Address')) {
-                            const match = lines[j].match(/([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})/);
-                            if (match) return match[0];
-                        }
+                    if (match) {
+                        console.debug(`Found MAC for ${ip} using ARP: ${match[0]}`);
+                        return match[0];
                     }
                 }
             }
         }
 
+        // Try netsh as last resort
+        try {
+            const cmd = `netsh interface ip show neighbors "${ip}"`;
+            const output = execSync(cmd, { encoding: 'utf8' });
+            const match = output.match(/([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})/);
+            if (match) {
+                console.debug(`Found MAC for ${ip} using netsh: ${match[0]}`);
+                return match[0];
+            }
+        } catch (e) {
+            console.debug(`netsh MAC resolution failed for ${ip}`);
+        }
+
         return 'Unknown';
     } catch (error) {
-        console.error(`Failed to get MAC for ${ip} using Windows commands:`, error.message);
+        console.error(`Failed to get MAC for ${ip}:`, error.message);
         return 'Unknown';
     }
 }
@@ -135,16 +150,11 @@ function isCommandAvailable(command) {
 
 // Update Linux MAC resolution function
 async function getLinuxMAC(ip, interfaceName) {
-    // Try arp-scan first (most reliable according to man page)
+    let mac = 'Unknown';
+    
+    // Try arp-scan first (most reliable)
     if (isCommandAvailable('arp-scan')) {
         try {
-            // Using documented options from man page:
-            // --interface: specify network interface
-            // --quiet: minimal output
-            // --ignoredups: ignore duplicate packets
-            // --retry=1: single retry (faster)
-            // --timeout=500: 500ms timeout (good balance)
-            // Target specific IP instead of --localnet for accuracy
             const output = await executeCommand([
                 'sudo', 'arp-scan',
                 `--interface=${interfaceName}`,
@@ -155,68 +165,82 @@ async function getLinuxMAC(ip, interfaceName) {
                 ip
             ].join(' '));
             
-            if (output) {
-                const match = output.match(/([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}/);
-                if (match) return match[0];
+            // Look for MAC address in output
+            const match = output.match(/([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}/);
+            if (match) {
+                mac = match[0];
+                console.debug(`Found MAC for ${ip} using arp-scan: ${mac}`);
+                return mac;
             }
         } catch (e) {
             console.debug(`arp-scan failed for ${ip}: ${e.message}`);
         }
     }
 
-    // Try node-arp as fallback
-    try {
-        const mac = await new Promise((resolve) => {
-            arp.getMAC(ip, (err, mac) => {
-                if (mac) {
-                    resolve(mac);
-                } else {
-                    resolve(null);
-                }
-            });
-        });
-        if (mac) return mac;
-    } catch (e) {
-        console.debug(`node-arp failed for ${ip}`);
-    }
-
-    // Try ip neighbor as last resort
+    // Try ip neighbor show as second option
     try {
         const output = await executeCommand(`ip neighbor show ${ip}`);
-        if (output) {
-            const match = output.match(/([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}/);
-            if (match) return match[0];
+        const match = output.match(/([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}/);
+        if (match) {
+            mac = match[0];
+            console.debug(`Found MAC for ${ip} using ip neighbor: ${mac}`);
+            return mac;
         }
     } catch (e) {
         console.debug(`ip neighbor failed for ${ip}`);
     }
 
+    // Try node-arp as last resort
+    try {
+        const arpMac = await new Promise((resolve) => {
+            arp.getMAC(ip, (err, mac) => {
+                if (err) {
+                    console.debug(`node-arp error for ${ip}: ${err.message}`);
+                    resolve(null);
+                } else {
+                    resolve(mac);
+                }
+            });
+        });
+        if (arpMac) {
+            console.debug(`Found MAC for ${ip} using node-arp: ${arpMac}`);
+            return arpMac;
+        }
+    } catch (e) {
+        console.debug(`node-arp failed for ${ip}`);
+    }
+
+    console.debug(`Could not resolve MAC for ${ip}`);
     return 'Unknown';
 }
 
-// Modify getMACAddress function
+// Update getMACAddress function
 async function getMACAddress(ip) {
     if (!isWindows && !isLinux) {
         console.warn(`MAC address resolution not implemented for ${process.platform}`);
-        return 'Unknown';
+        return {
+            address: 'Unknown',
+            vendor: 'Unknown',
+            countryCode: 'N/A'
+        };
     }
 
-    if (isLinux) {
-        const interfaceName = activeInterface ? activeInterface.name : 'eth0';
-        const mac = await getLinuxMAC(ip, interfaceName);
-        const ouiInfo = lookupOUI(mac);
+    let mac = 'Unknown';
+    try {
+        if (isLinux) {
+            const interfaceName = activeInterface ? activeInterface.name : 'eth0';
+            mac = await getLinuxMAC(ip, interfaceName);
+        } else {
+            mac = await getWindowsMAC(ip);
+        }
+        
+        return await macResolver.getVendorInfo(mac, ip);
+    } catch (error) {
+        console.error(`MAC resolution failed for ${ip}:`, error);
         return {
-            address: mac,
-            vendor: ouiInfo ? ouiInfo.companyName : 'Unknown',
-            countryCode: ouiInfo ? ouiInfo.countryCode : null
-        };
-    } else {
-        const mac = await getWindowsMAC(ip);
-        const ouiInfo = lookupOUI(mac);
-        return {
-            address: mac,
-            vendor: ouiInfo ? ouiInfo.companyName : 'Unknown',
-            countryCode: ouiInfo ? ouiInfo.countryCode : null
+            address: 'Unknown',
+            vendor: 'Unknown',
+            countryCode: 'N/A'
         };
     }
 }
@@ -342,7 +366,141 @@ function lookupOUI(mac) {
     return macDatabase.find(entry => entry.oui.replace(/[:\-]/g, '').toUpperCase() === oui) || null;
 }
 
+// Add discovery endpoint before other routes
+app.get('/api/network/topology', async (req, res) => {
+    try {
+        const discovery = new NetworkDiscovery(config);
+        const topology = await discovery.discover();
+        res.json(topology);
+    } catch (error) {
+        console.error('Topology error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // Update the /api/scan endpoint to use the new CIDR parsing
+function chunkArray(array, chunkSize) {
+    const chunks = [];
+    for (let i = 0; i < array.length; i += chunkSize) {
+        chunks.push(array.slice(i, i + chunkSize));
+    }
+    return chunks;
+}
+
+async function scanChunk(ipList, options = {}) {
+    const startTime = Date.now();
+    const { chunkNum, totalChunks } = options;
+    const scanProgress = {
+        currentChunk: chunkNum,
+        totalChunks: totalChunks,
+        chunkStart: ipList[0],
+        chunkEnd: ipList[ipList.length - 1],
+        totalHosts: ipList.length
+    };
+
+    const networkDevices = [];
+    const scanPromises = [];
+
+    for (const ip of ipList) {
+        // Skip if scanning local network and IP matches local device or gateway
+        if (options.activeInterface && 
+            (ip === options.activeInterface.ip_address || ip === options.activeInterface.gateway_ip)) {
+            continue;
+        }
+
+        scanPromises.push(
+            ping.promise.probe(ip, {
+                timeout: 1,
+                min_reply: 1
+            }).then(async (res) => {
+                if (res.alive) {
+                    const macInfo = await getMACAddress(ip);
+                    const hostname = await getHostname(ip);
+                    const openPorts = await scanPorts(ip);
+                    networkDevices.push({
+                        ip: ip,         // Ensure IP is set
+                        id: ip,         // Set ID to match IP for D3
+                        mac: macInfo.address,
+                        manufacturer: {
+                            companyName: macInfo.vendor || 'Unknown',
+                            countryCode: macInfo.countryCode || 'N/A'
+                        },
+                        name: hostname || `Device ${networkDevices.length + 1}`,
+                        hostname,
+                        ports: openPorts,
+                        isAlive: true
+                    });
+                }
+            }).catch(err => {
+                console.warn(`Error scanning ${ip}:`, err.message);
+            })
+        );
+    }
+
+    await Promise.all(scanPromises);
+
+    const endTime = Date.now();
+    const duration = ((endTime - startTime) / 1000).toFixed(1);
+    console.log(`Chunk ${chunkNum}/${totalChunks} completed in ${duration}s: ${ipList[0]} to ${ipList[ipList.length - 1]}`);
+
+    return {
+        devices: networkDevices,
+        progress: scanProgress,
+        duration: duration
+    };
+}
+
+// Update /api/scan endpoint
+async function analyzeConnections(devices, topology) {
+    const connections = new Map();
+    
+    // Group devices by subnet
+    const subnetGroups = new Map();
+    for (const device of devices) {
+        const subnet = topology.subnets.find(s => isInSubnet(device.ip, s.cidr));
+        if (subnet) {
+            if (!subnetGroups.has(subnet.cidr)) {
+                subnetGroups.set(subnet.cidr, []);
+            }
+            subnetGroups.get(subnet.cidr).push(device);
+        }
+    }
+
+    // Create connections based on network topology
+    for (const [cidr, subnetDevices] of subnetGroups) {
+        const subnet = topology.subnets.find(s => s.cidr === cidr);
+        const gateway = topology.gateways.find(g => g.ip === subnet.gateway);
+        
+        if (gateway) {
+            // Connect devices to their subnet gateway
+            subnetDevices.forEach(device => {
+                if (device.ip !== gateway.ip) {
+                    connections.set(`${device.ip}-${gateway.ip}`, {
+                        type: 'subnet',
+                        strength: 1
+                    });
+                }
+            });
+        }
+    }
+
+    // Connect gateways to each other based on routes
+    topology.routes.forEach(route => {
+        if (route.via) {
+            connections.set(`${route.destination}-${route.via}`, {
+                type: 'route',
+                strength: 0.5
+            });
+        }
+    });
+
+    return Array.from(connections.entries()).map(([key, value]) => {
+        const [source, target] = key.split('-');
+        return { source, target, ...value };
+    });
+}
+
+// Modify /api/scan endpoint
 app.get('/api/scan', async (req, res) => {
     try {
         const customRange = req.query.range;
@@ -353,24 +511,22 @@ app.get('/api/scan', async (req, res) => {
             if (!parsedRange) {
                 throw new Error('Invalid IP range');
             }
-            
-            // Get start and end components
-            const [startIP1, startIP2, startIP3, startIP4] = parsedRange.startAddress.split('.').map(Number);
-            const [endIP1, endIP2, endIP3, endIP4] = parsedRange.endAddress.split('.').map(Number);
-            
-            console.log(`Scanning range from ${parsedRange.startAddress} to ${parsedRange.endAddress}`);
-            
-            if (parsedRange.networkSize > 1000) {
-                throw new Error('Network size too large. Please use a smaller range for scanning.');
+
+            if (parsedRange.networkSize > config.scanner.maxTotalSize) {
+                throw new Error(`Network size too large. Maximum allowed is ${config.scanner.maxTotalSize} hosts.`);
             }
 
+            // Generate list of IPs to scan
             scanRange = {
                 startIP: parsedRange.startAddress,
                 endIP: parsedRange.endAddress,
-                ipList: [] // Will be populated with all IPs to scan
+                ipList: []
             };
 
-            // Generate list of IPs to scan
+            // Generate complete IP list
+            const [startIP1, startIP2, startIP3, startIP4] = parsedRange.startAddress.split('.').map(Number);
+            const [endIP1, endIP2, endIP3, endIP4] = parsedRange.endAddress.split('.').map(Number);
+            
             for (let i1 = startIP1; i1 <= endIP1; i1++) {
                 for (let i2 = (i1 === startIP1 ? startIP2 : 0); i2 <= (i1 === endIP1 ? endIP2 : 255); i2++) {
                     for (let i3 = (i1 === startIP1 && i2 === startIP2 ? startIP3 : 0); 
@@ -382,6 +538,73 @@ app.get('/api/scan', async (req, res) => {
                     }
                 }
             }
+            
+            // Split IPs into chunks
+            const chunks = chunkArray(scanRange.ipList, config.scanner.maxChunkSize);
+            const allDevices = [];
+            let lastProgress = null;
+            
+            // Process each chunk
+            for (let i = 0; i < chunks.length; i++) {
+                const chunkResult = await scanChunk(chunks[i], { 
+                    activeInterface,
+                    chunkNum: i + 1,
+                    totalChunks: chunks.length
+                });
+                
+                allDevices.push(...chunkResult.devices);
+                lastProgress = chunkResult.progress;
+                
+                // Add delay between chunks except for the last one
+                if (i < chunks.length - 1) {
+                    await new Promise(resolve => setTimeout(resolve, config.scanner.chunkDelay));
+                }
+            }
+
+            // Create graph data structure
+            const nodes = allDevices.map(device => ({
+                id: device.ip,
+                mac: device.mac || 'Unknown',
+                name: device.name || 'Unknown Device',
+                isGateway: device.isGateway || false,
+                isLocal: device.isLocal || false,
+                manufacturer: device.manufacturer,
+                ports: device.ports || [],
+                hostname: device.hostname
+            }));
+
+            // Create links - use first device as central node for custom ranges
+            const centralNode = activeInterface ? activeInterface.gateway_ip : nodes[0].id;
+            const links = nodes
+                .filter(node => node.id !== centralNode)
+                .map(node => ({
+                    source: node.id,
+                    target: centralNode,
+                    value: 1
+                }));
+
+            // Add network topology data
+            const discovery = new NetworkDiscovery(config);
+            const topology = await discovery.discover();
+            const connections = await analyzeConnections(allDevices, topology);
+
+            // Update node data with subnet information
+            const updatedNodes = allDevices.map(device => {
+                const subnet = topology.subnets.find(s => isInSubnet(device.ip, s.cidr));
+                return {
+                    ...device,
+                    subnet: subnet ? subnet.cidr : null,
+                    isGateway: topology.gateways.some(g => g.ip === device.ip)
+                };
+            });
+
+            res.json({ 
+                nodes: updatedNodes,
+                links: connections,
+                topology,
+                scanRange,
+                scanProgress: lastProgress
+            });
         } else {
             // Get local network interface info and set up local scan
             const interfaces = await new Promise((resolve, reject) => {
@@ -414,63 +637,10 @@ app.get('/api/scan', async (req, res) => {
                 startHost: 1,
                 endHost: 254
             };
-        }
 
-        const networkDevices = [];
-        const scanPromises = [];
+            const networkDevices = [];
+            const scanPromises = [];
 
-        // Create a central node for custom range scans if no gateway is available
-        if (customRange && !activeInterface) {
-            networkDevices.push({
-                ip: scanRange.ipList[0],
-                mac: 'Unknown',
-                manufacturer: {
-                    companyName: 'Unknown',
-                    companyAddress: 'N/A',
-                    countryCode: 'N/A',
-                    oui: 'Unknown'
-                },
-                isLocal: true,
-                name: 'Network Center'
-            });
-        }
-
-        // Update scanning logic to use ipList when available
-        if (scanRange.ipList) {
-            // Use the generated IP list for custom ranges
-            for (const ip of scanRange.ipList) {
-                scanPromises.push(
-                    ping.promise.probe(ip, {
-                        timeout: 1,
-                        min_reply: 1
-                    }).then(async (res) => {
-                        if (res.alive) {
-                            const macInfo = await getMACAddress(ip);
-                            const hostname = await getHostname(ip);
-                            const openPorts = await scanPorts(ip);
-                            const manufacturer = lookupOUI(macInfo.address) || {
-                                companyName: 'Unknown',
-                                companyAddress: 'N/A',
-                                countryCode: 'N/A',
-                                oui: 'Unknown'
-                            };
-
-                            networkDevices.push({
-                                ip,
-                                mac: macInfo.address,
-                                manufacturer,
-                                name: hostname || `Device ${networkDevices.length + 1}`,
-                                hostname,
-                                ports: openPorts,
-                                isAlive: true
-                            });
-                        }
-                    }).catch(err => {
-                        console.warn(`Error scanning ${ip}:`, err.message);
-                    })
-                );
-            }
-        } else {
             // Scan the specified range
             for (let i = scanRange.startHost; i <= scanRange.endHost; i++) {
                 const ip = `${scanRange.baseIP}.${i}`;
@@ -490,13 +660,12 @@ app.get('/api/scan', async (req, res) => {
                             const hostname = await getHostname(ip);
                             const openPorts = await scanPorts(ip);
                             networkDevices.push({
-                                ip,
+                                ip: ip,         // Ensure IP is set
+                                id: ip,         // Set ID to match IP for D3
                                 mac: macInfo.address,
-                                manufacturer: lookupOUI(macInfo.address) || {
-                                    companyName: 'Unknown',
-                                    companyAddress: 'N/A',
-                                    countryCode: 'N/A',
-                                    oui: 'Unknown'
+                                manufacturer: {
+                                    companyName: macInfo.vendor || 'Unknown',
+                                    countryCode: macInfo.countryCode || 'N/A'
                                 },
                                 name: hostname || `Device ${networkDevices.length + 1}`,
                                 hostname,
@@ -507,56 +676,67 @@ app.get('/api/scan', async (req, res) => {
                     })
                 );
             }
-        }
 
-        await Promise.all(scanPromises);
+            await Promise.all(scanPromises);
 
-        // Ensure we have at least one device before creating the graph
-        if (networkDevices.length === 0) {
-            res.json({
-                nodes: [],
-                links: [],
-                scanRange: {
-                    start: scanRange.startIP || `${scanRange.baseIP}.${scanRange.startHost}`,
-                    end: scanRange.endIP || `${scanRange.baseIP}.${scanRange.endHost}`,
-                    total: scanRange.ipList ? scanRange.ipList.length : (scanRange.endHost - scanRange.startHost + 1)
-                }
-            });
-            return;
-        }
+            // Ensure we have at least one device before creating the graph
+            if (networkDevices.length === 0) {
+                res.json({
+                    nodes: [],
+                    links: [],
+                    scanRange: {
+                        start: scanRange.startIP || `${scanRange.baseIP}.${scanRange.startHost}`,
+                        end: scanRange.endIP || `${scanRange.baseIP}.${scanRange.endHost}`,
+                        total: scanRange.ipList ? scanRange.ipList.length : (scanRange.endHost - scanRange.startHost + 1)
+                    }
+                });
+                return;
+            }
 
-        // Create graph data structure
-        const nodes = networkDevices.map(device => ({
-            id: device.ip,
-            mac: device.mac || 'Unknown',
-            name: device.name || 'Unknown Device',
-            isGateway: device.isGateway || false,
-            isLocal: device.isLocal || false,
-            manufacturer: device.manufacturer,
-            ports: device.ports || [],
-            hostname: device.hostname
-        }));
-
-        // Create links - use first device as central node for custom ranges
-        const centralNode = activeInterface ? activeInterface.gateway_ip : nodes[0].id;
-        const links = nodes
-            .filter(node => node.id !== centralNode)
-            .map(node => ({
-                source: node.id,
-                target: centralNode,
-                value: 1
+            // Create graph data structure
+            const nodes = networkDevices.map(device => ({
+                id: device.ip,
+                mac: device.mac || 'Unknown',
+                name: device.name || 'Unknown Device',
+                isGateway: device.isGateway || false,
+                isLocal: device.isLocal || false,
+                manufacturer: device.manufacturer,
+                ports: device.ports || [],
+                hostname: device.hostname
             }));
 
-        res.json({ 
-            nodes, 
-            links,
-            scanRange: {
-                start: scanRange.startIP || `${scanRange.baseIP}.${scanRange.startHost}`,
-                end: scanRange.endIP || `${scanRange.baseIP}.${scanRange.endHost}`,
-                total: scanRange.ipList ? scanRange.ipList.length : (scanRange.endHost - scanRange.startHost + 1)
-            }
-        });
+            // Create links - use first device as central node for custom ranges
+            const centralNode = activeInterface ? activeInterface.gateway_ip : nodes[0].id;
+            const links = nodes
+                .filter(node => node.id !== centralNode)
+                .map(node => ({
+                    source: node.id,
+                    target: centralNode,
+                    value: 1
+                }));
 
+            // Add network topology data
+            const discovery = new NetworkDiscovery(config);
+            const topology = await discovery.discover();
+            const connections = await analyzeConnections(networkDevices, topology);
+
+            // Update node data with subnet information
+            const updatedNodes = networkDevices.map(device => {
+                const subnet = topology.subnets.find(s => isInSubnet(device.ip, s.cidr));
+                return {
+                    ...device,
+                    subnet: subnet ? subnet.cidr : null,
+                    isGateway: topology.gateways.some(g => g.ip === device.ip)
+                };
+            });
+
+            res.json({ 
+                nodes: updatedNodes,
+                links: connections,
+                topology,
+                scanRange
+            });
+        }
     } catch (error) {
         console.error('Scan error:', error);
         res.status(500).json({ 
@@ -585,7 +765,7 @@ app.get('/api/connections', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
     console.log(`Server running on port ${PORT}`);
-    await loadMACDatabase();
+    await macResolver.initialize();
     checkOSSupport();
     checkRequiredTools();
     const monitor = startTrafficMonitoring();
@@ -606,3 +786,19 @@ function checkRequiredTools() {
         }
     }
 }
+
+// Add subnet membership check function
+function isInSubnet(ip, cidr) {
+    if (!ip || !cidr) return false;
+    
+    const [networkAddress, bits] = cidr.split('/');
+    const mask = Number(bits);
+    
+    const ipBinary = ip.split('.')
+        .map(octet => Number(octet).toString(2).padStart(8, '0'))
+        .join('');
+    
+    const networkBinary = networkAddress.split('.')
+        .map(octet => Number(octet).toString(2).padStart(8, '0'))
+        .join('');
+        return ipBinary.substring(0, mask) === networkBinary.substring(0, mask);}

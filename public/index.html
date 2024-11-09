@@ -60,7 +60,16 @@
 
         #graph {
             flex: 1;
-            background: white;
+            position: relative;
+            overflow: hidden;
+            width: 100%;
+            height: calc(100vh - 60px);  /* Adjust for header height */
+        }
+
+        svg {
+            position: absolute;
+            width: 100%;
+            height: 100%;
         }
 
         .console-container {
@@ -247,6 +256,97 @@
             font-weight: bold;
             margin-bottom: 3px;
         }
+
+        .node.gateway {
+            stroke: #ff4444;
+            stroke-width: 2px;
+        }
+
+        .node-label.gateway {
+            fill: #ff4444;
+            font-weight: bold;
+        }
+
+        .subnet-group {
+            stroke: #ddd;
+            stroke-width: 1px;
+            fill: rgba(200, 200, 200, 0.1);
+        }
+        
+        .link.subnet {
+            stroke: #666;
+            stroke-dasharray: none;
+        }
+        
+        .link.route {
+            stroke: #999;
+            stroke-dasharray: 5,5;
+        }
+
+        .node-list-panel {
+            width: 250px;
+            background: #fff;
+            border-right: 1px solid #ddd;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .node-list-header {
+            padding: 10px;
+            background: #f5f5f5;
+            border-bottom: 1px solid #ddd;
+            font-weight: bold;
+        }
+
+        .node-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+        }
+
+        .node-list-item {
+            padding: 8px;
+            border-bottom: 1px solid #eee;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .node-list-item:hover {
+            background: #f5f5f5;
+        }
+
+        .node-list-item.selected {
+            background: #e3f2fd;
+        }
+
+        .node-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #1f77b4;
+        }
+
+        .node-indicator.gateway {
+            background: #ff4444;
+        }
+
+        .node.selected {
+            stroke: #2196f3;
+            stroke-width: 2px;
+        }
+
+        .node-details {
+            padding: 10px;
+            background: #f5f5f5;
+            border-top: 1px solid #ddd;
+            display: none;
+        }
+
+        .node-details.visible {
+            display: block;
+        }
     </style>
 </head>
 <body>
@@ -262,6 +362,11 @@
         </div>
     </div>
     <div class="main-container">
+        <div class="node-list-panel">
+            <div class="node-list-header">Network Nodes</div>
+            <div class="node-list" id="nodeList"></div>
+            <div class="node-details" id="nodeDetails"></div>
+        </div>
         <div id="graph"></div>
         <div class="console-container">
             <div class="console-header">Console Output</div>
@@ -320,18 +425,18 @@
             .attr("class", "tooltip")
             .style("opacity", 0);
 
-        // Create force simulation
+        // Update force simulation configuration
         const simulation = d3.forceSimulation()
             .force("link", d3.forceLink().id(d => d.id)
-                .distance(100)    // Reduced distance
-                .strength(0.5)    // Reduced strength for more stability
+                .distance(100)
+                .strength(0.5)
             )
             .force("charge", d3.forceManyBody()
-                .strength(-300)   // Reduced repulsion
-                .distanceMax(250) // Limit force application range
+                .strength(-500)   // Increased repulsion
+                .distanceMax(300) // Increased range
             )
             .force("center", d3.forceCenter(width / 2, height / 2))
-            .force("collision", d3.forceCollide().radius(20));
+            .force("collision", d3.forceCollide().radius(30)); // Increased collision radius
 
         // Modify startScan function
         async function startScan() {
@@ -348,21 +453,98 @@
                 const url = ipRange ? `/api/scan?range=${encodeURIComponent(ipRange)}` : '/api/scan';
                 
                 const response = await fetch(url);
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Scan failed');
+                }
+                
                 const data = await response.json();
+
+                // Update progress info for chunked scans
+                if (data.scanProgress) {
+                    const { currentChunk, totalChunks, chunkStart, chunkEnd, totalHosts } = data.scanProgress;
+                    logToConsole(`Starting chunk ${currentChunk}/${totalChunks} (${chunkStart} to ${chunkEnd})`, 'info');
+                    updateStatus('scanning', `Scanning network... (${currentChunk}/${totalChunks})`);
+                    if (totalHosts) {
+                        logToConsole(`Total hosts to scan: ${totalHosts}`, 'info');
+                    }
+                }
+
+                // Update progress for large scans
+                if (data.scanRange && data.scanRange.chunks) {
+                    const total = data.scanRange.chunks.total;
+                    const completed = data.scanRange.chunks.completed;
+                    logToConsole(`Scanning chunk ${completed}/${total}`, 'info');
+                    updateStatus('scanning', `Scanning network... (${completed}/${total} chunks)`);
+                }
 
                 // Store data globally for use in updateConnections
                 window.networkData = data;
 
+                // Create links based on gateway presence
+                const gatewayNode = data.nodes.find(n => n.isGateway);
+                data.links = [];
+
+                if (gatewayNode) {
+                    // If gateway exists, create star topology
+                    data.nodes.forEach(node => {
+                        if (node.id !== gatewayNode.id) {
+                            data.links.push({
+                                source: node.id,
+                                target: gatewayNode.id,
+                                value: 1
+                            });
+                        }
+                    });
+                } else {
+                    // If no gateway, create mesh network topology
+                    data.nodes.forEach((node, i) => {
+                        // Connect to several nearest nodes
+                        for (let j = i + 1; j < Math.min(i + 4, data.nodes.length); j++) {
+                            data.links.push({
+                                source: node.id,
+                                target: data.nodes[j].id,
+                                value: 1
+                            });
+                        }
+                    });
+                }
+
                 // Create the graph group
                 const graphGroup = svg.append("g").attr("class", "graph-group");
 
-                // Create links with updated styling
+                // Create subnet groups
+                const subnets = new Map();
+                data.nodes.forEach(node => {
+                    if (node.subnet) {
+                        if (!subnets.has(node.subnet)) {
+                            subnets.set(node.subnet, []);
+                        }
+                        subnets.get(node.subnet).push(node);
+                    }
+                });
+
+                // Create subnet backgrounds
+                const subnetGroup = graphGroup.append("g")
+                    .selectAll("g")
+                    .data(Array.from(subnets.entries()))
+                    .enter().append("g")
+                    .attr("class", "subnet-group");
+
+                subnetGroup.append("path")
+                    .attr("class", "subnet-background")
+                    .attr("d", ([_, nodes]) => {
+                        const points = nodes.map(n => ({ x: n.x, y: n.y }));
+                        return createConvexHull(points);
+                    });
+
+                // Create links with type information
                 const link = graphGroup.append("g")
                     .selectAll("line")
                     .data(data.links)
                     .enter().append("line")
-                    .attr("class", "link")
-                    .attr("stroke-width", d => d.value || 1.5);
+                    .attr("class", d => `link ${d.type}`)
+                    .attr("stroke-width", d => d.strength || 1);
 
                 // Create marker definitions for arrows with adjusted size
                 graphGroup.append("defs").selectAll("marker")
@@ -389,14 +571,18 @@
 
                 // Add circles for nodes
                 nodeGroup.append("circle")
-                    .attr("class", "node")
-                    .attr("r", d => d.isGateway ? 8 : 5)
-                    .attr("fill", d => d.isGateway ? "#ff4444" : d.isLocal ? "#4CAF50" : "#1f77b4");
+                    .attr("class", d => `node ${d.isGateway ? 'gateway' : ''}`)
+                    .attr("r", d => d.isGateway ? 10 : 5)
+                    .attr("fill", d => {
+                        if (d.isGateway) return "#ff4444";
+                        if (d.isLocal) return "#4CAF50";
+                        return "#1f77b4";
+                    });
 
                 // Add labels
                 nodeGroup.append("text")
-                    .attr("class", "node-label")
-                    .attr("dx", 12)
+                    .attr("class", d => `node-label ${d.isGateway ? 'gateway' : ''}`)
+                    .attr("dx", d => d.isGateway ? 15 : 12)
                     .attr("dy", 4)
                     .text(d => `${d.name || d.id}`);
 
@@ -459,6 +645,9 @@
                             .scale(scale)
                     );
 
+                // Add node list update after graph creation
+                updateNodeList(data.nodes);
+
                 // Update UI state
                 updateStatus('complete', 'Scan complete');
                 logToConsole('Network scan completed successfully', 'success');
@@ -519,7 +708,7 @@
                             ${d.status || 'Unknown'}
                         </div>
                         <div class="tooltip-label">IP:</div>
-                        <div class="tooltip-value">${d.id}</div>
+                        <div class="tooltip-value">${d.ip || d.id || 'Unknown'}</div>
                         <div class="tooltip-label">MAC:</div>
                         <div class="tooltip-value">${d.mac || 'Unknown'}</div>
                         <div class="tooltip-label">Type:</div>
@@ -532,9 +721,9 @@
                     <div class="tooltip-title">Manufacturer Info</div>
                     <div class="tooltip-grid">
                         <div class="tooltip-label">Name:</div>
-                        <div class="tooltip-value">${d.manufacturer?.companyName || 'Unknown'}</div>
+                        <div class="tooltip-value">${d.manufacturer ? (d.manufacturer.companyName || 'Unknown') : 'Unknown'}</div>
                         <div class="tooltip-label">Country:</div>
-                        <div class="tooltip-value">${d.manufacturer?.countryCode || 'N/A'}</div>
+                        <div class="tooltip-value">${d.manufacturer ? (d.manufacturer.countryCode || 'N/A') : 'N/A'}</div>
                     </div>
                 </div>
             `)
@@ -576,6 +765,101 @@
             event.subject.fx = null;
             event.subject.fy = null;
             logToConsole(`Finished dragging node: ${event.subject.id}`, 'info');
+        }
+
+        // Add helper function for subnet grouping force
+        function forceSubnetGroup(subnets) {
+            return function(alpha) {
+                for (const [subnet, nodes] of subnets) {
+                    const center = getSubnetCenter(nodes);
+                    nodes.forEach(node => {
+                        node.vx += (center.x - node.x) * alpha * 0.1;
+                        node.vy += (center.y - node.y) * alpha * 0.1;
+                    });
+                }
+            };
+        }
+
+        function getSubnetCenter(nodes) {
+            const n = nodes.length;
+            return {
+                x: nodes.reduce((sum, node) => sum + node.x, 0) / n,
+                y: nodes.reduce((sum, node) => sum + node.y, 0) / n
+            };
+        }
+
+        // Add convex hull calculation for subnet backgrounds
+        function createConvexHull(points) {
+            // ... implement convex hull algorithm ...
+            // You can use d3.polygonHull() or another convex hull algorithm
+        }
+
+        // Add node list management functions
+        function updateNodeList(nodes) {
+            const nodeList = document.getElementById('nodeList');
+            nodeList.innerHTML = '';
+            
+            // Sort nodes by type (gateway first) and then by name
+            const sortedNodes = [...nodes].sort((a, b) => {
+                if (a.isGateway !== b.isGateway) return b.isGateway - a.isGateway;
+                return (a.name || a.id).localeCompare(b.name || b.id);
+            });
+
+            sortedNodes.forEach(node => {
+                const item = document.createElement('div');
+                item.className = 'node-list-item';
+                item.innerHTML = `
+                    <div class="node-indicator ${node.isGateway ? 'gateway' : ''}"></div>
+                    <div>${node.name || node.id}</div>
+                `;
+                
+                item.addEventListener('click', () => selectNode(node));
+                nodeList.appendChild(item);
+            });
+        }
+
+        function selectNode(node) {
+            // Update node list selection
+            document.querySelectorAll('.node-list-item').forEach(item => {
+                item.classList.remove('selected');
+                if (item.querySelector('div:last-child').textContent === (node.name || node.id)) {
+                    item.classList.add('selected');
+                }
+            });
+
+            // Update node visualization
+            d3.selectAll('.node').classed('selected', d => d.id === node.id);
+
+            // Center view on selected node
+            const transform = d3.zoomTransform(svg.node());
+            svg.transition()
+                .duration(750)
+                .call(zoom.transform, 
+                    d3.zoomIdentity
+                        .translate(width/2, height/2)
+                        .scale(transform.k)
+                        .translate(-node.x, -node.y)
+                );
+
+            // Update details panel
+            const details = document.getElementById('nodeDetails');
+            details.innerHTML = `
+                <div class="tooltip-grid">
+                    <div class="tooltip-label">IP:</div>
+                    <div class="tooltip-value">${node.id}</div>
+                    <div class="tooltip-label">MAC:</div>
+                    <div class="tooltip-value">${node.mac || 'Unknown'}</div>
+                    <div class="tooltip-label">Type:</div>
+                    <div class="tooltip-value">${node.isGateway ? 'Gateway' : 'Device'}</div>
+                    ${node.ports?.length ? `
+                        <div class="tooltip-label">Ports:</div>
+                        <div class="tooltip-value">${node.ports.join(', ')}</div>
+                    ` : ''}
+                    <div class="tooltip-label">Vendor:</div>
+                    <div class="tooltip-value">${node.manufacturer?.companyName || 'Unknown'}</div>
+                </div>
+            `;
+            details.classList.add('visible');
         }
 
         // Initial setup
